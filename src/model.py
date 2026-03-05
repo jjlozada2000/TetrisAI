@@ -1,31 +1,43 @@
+"""
+model.py — Neural Network for Tetris (Board Evaluation)
+
+Architecture: 3-layer fully connected network
+    Input:  31 board features (heights, holes, bumpiness, max_h, lines_cleared)
+    Hidden: 64 → 64 neurons with ReLU
+    Output: 1 scalar — predicted board quality (V-value)
+
+The agent evaluates each possible placement by:
+    1. Simulating the placement
+    2. Extracting board features from the result
+    3. Feeding features through this network → quality score
+    4. Picking the placement with the highest score
+"""
+
 import torch
 import torch.nn as nn
 
 
 class TetrisNet(nn.Module):
-    def __init__(self, input_size: int = 45, n_actions: int = 6):
+    """
+    Board evaluation network for Tetris.
+
+    Input  : board feature vector (31 floats)
+    Output : single scalar — predicted board quality
+    """
+
+    def __init__(self, input_size: int = 31):
         super().__init__()
 
         self.net = nn.Sequential(
-            # Layer 1
-            nn.Linear(input_size, 256),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-
-            # Layer 2
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Dropout(p=0.1),
-
-            # Layer 3
-            nn.Linear(256, 128),
+            nn.Linear(input_size, 64),
             nn.ReLU(),
 
-            # Output — one Q-value per action
-            nn.Linear(128, n_actions),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+
+            nn.Linear(64, 1),
         )
 
-        # Initialise weights with He initialisation (best practice for ReLU nets)
         self._init_weights()
 
     def _init_weights(self):
@@ -39,12 +51,11 @@ class TetrisNet(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick sanity check
-    model = TetrisNet()
-    dummy  = torch.zeros(1, 45)
+    model  = TetrisNet()
+    dummy  = torch.zeros(1, 31)
     output = model(dummy)
     print(f"Input shape  : {dummy.shape}")
-    print(f"Output shape : {output.shape}")
-    print(f"Q-values     : {output.detach().numpy()}")
+    print(f"Output shape : {output.shape}")    # should be (1, 1)
+    print(f"Score        : {output.item():.4f}")
     print(f"Parameters   : {sum(p.numel() for p in model.parameters()):,}")
     print("model.py sanity check passed.")

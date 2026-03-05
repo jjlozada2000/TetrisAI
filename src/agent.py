@@ -1,3 +1,19 @@
+"""
+agent.py — DQN Agent for Tetris (Board-Evaluation Approach)
+
+Instead of Q(state) → 40 action values, this agent:
+  1. Gets all valid placements from the environment
+  2. For each placement, gets the resulting board features
+  3. Feeds each feature vector through the network → V(next_state)
+  4. Picks the placement with the highest V(next_state)
+
+Training uses the standard DQN update:
+  V(state) = reward + gamma * V(best_next_state)
+
+This is much easier to learn because the network only outputs 1 value
+and evaluates concrete board states rather than abstract action indices.
+"""
+
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -11,42 +27,42 @@ import torch.nn as nn
 import torch.optim as optim
 
 from model import TetrisNet
-from env import N_ACTIONS
+from env import N_FEATURES
 
 
-# Hyperparameters
+# ── Hyperparameters ───────────────────────────────────────────────────────────
 
-BATCH_SIZE       = 64       # samples per training step
-GAMMA            = 0.99     # discount factor — how much future rewards matter
-LR               = 1e-3     # learning rate
-MEMORY_SIZE      = 50_000   # max experiences stored in replay buffer
+BATCH_SIZE       = 512      # larger batches — more stable gradients
+GAMMA            = 0.99     # higher discount — long-term planning matters in Tetris
+LR               = 1e-3     # can be higher since network is smaller (31→64→64→1)
+MEMORY_SIZE      = 30_000   # replay buffer size
 EPSILON_START    = 1.0      # start fully random
-EPSILON_MIN      = 0.01     # never go below 1% random
-EPSILON_DECAY    = 0.9995   # multiply epsilon by this each step
-TARGET_UPDATE    = 500      # sync target network every N steps
+EPSILON_MIN      = 0.001    # very low — the network should handle exploration via scoring
+EPSILON_DECAY    = 0.999    # per episode
+TARGET_UPDATE    = 500      # sync target network every N episodes
+MIN_REPLAY_SIZE  = 2000     # fill buffer before training
 
 
-# Replay Buffer
+# ── Replay Buffer ─────────────────────────────────────────────────────────────
 
 class ReplayBuffer:
     """
-    Stores past experiences as (state, action, reward, next_state, done).
-    Training samples random batches from here — this breaks the correlation
-    between consecutive steps which would otherwise destabilize training.
+    Stores (state_features, reward, next_state_features, done).
+    state_features: the features of the board state the agent chose.
+    next_state_features: the features of the best next state (after next piece).
     """
 
     def __init__(self, capacity: int = MEMORY_SIZE):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, state, reward, next_state, done):
+        self.buffer.append((state, reward, next_state, done))
 
     def sample(self, batch_size: int):
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, rewards, next_states, dones = zip(*batch)
         return (
             np.array(states,      dtype=np.float32),
-            np.array(actions,     dtype=np.int64),
             np.array(rewards,     dtype=np.float32),
             np.array(next_states, dtype=np.float32),
             np.array(dones,       dtype=np.float32),
@@ -56,26 +72,17 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# DQN Agent
+# ── DQN Agent ─────────────────────────────────────────────────────────────────
 
 class DQNAgent:
     """
-    Deep Q-Network agent.
+    Board-evaluation DQN agent.
 
-    Parameters
-    ----------
-    obs_size   : int   — size of the observation vector (45)
-    n_actions  : int   — number of possible actions (6)
-    device     : str   — 'mps', 'cuda', or 'cpu'
+    Evaluates each possible placement by scoring the resulting board state.
+    Picks the placement with the highest score (with epsilon-greedy exploration).
     """
 
-    def __init__(
-        self,
-        obs_size:  int = 45,
-        n_actions: int = N_ACTIONS,
-        device:    str = None,
-    ):
-        # Auto-select best available device (Apple Silicon → MPS)
+    def __init__(self, device: str = None):
         if device is None:
             if torch.backends.mps.is_available():
                 device = "mps"
@@ -86,76 +93,91 @@ class DQNAgent:
         self.device = torch.device(device)
         print(f"Using device: {self.device}")
 
-        self.n_actions = n_actions
-
-        # Two networks
-        self.policy_net = TetrisNet(obs_size, n_actions).to(self.device)
-        self.target_net = TetrisNet(obs_size, n_actions).to(self.device)
+        # Two networks — policy learns, target provides stable targets
+        self.policy_net = TetrisNet(N_FEATURES).to(self.device)
+        self.target_net = TetrisNet(N_FEATURES).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()   # target net is never trained directly
+        self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
-        self.loss_fn   = nn.SmoothL1Loss()   # Huber loss — more stable than MSE
+        self.loss_fn   = nn.MSELoss()
 
         self.memory    = ReplayBuffer(MEMORY_SIZE)
 
         self.epsilon   = EPSILON_START
-        self.steps     = 0
+        self.episodes  = 0
         self.losses    = []
 
-    # Action selection
+    # ── Action selection ──────────────────────────────────────────────────────
 
-    def select_action(self, state: np.ndarray) -> int:
+    def select_best(self, next_states):
         """
-        Epsilon-greedy action selection.
-        Random action with probability epsilon, best Q-value action otherwise.
+        Given a list of (features, placement_info) from env.get_next_states(),
+        return the index of the best placement.
+
+        With probability epsilon, picks randomly (exploration).
+        Otherwise, scores each state with the policy network and picks the best.
         """
+        if not next_states:
+            return 0
+
         if random.random() < self.epsilon:
-            return random.randint(0, self.n_actions - 1)
+            return random.randint(0, len(next_states) - 1)
 
+        # Score all candidate states in one batch
+        feature_batch = np.array([s[0] for s in next_states], dtype=np.float32)
         with torch.no_grad():
-            t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            q_values = self.policy_net(t)
-            return int(q_values.argmax().item())
+            self.policy_net.eval()
+            t = torch.tensor(feature_batch, device=self.device)
+            scores = self.policy_net(t).squeeze(1).cpu().numpy()
+            self.policy_net.train()
 
-    # Memory
+        return int(np.argmax(scores))
 
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.push(state, action, reward, next_state, done)
+    def score_states(self, feature_batch, use_target=False):
+        """Score a batch of feature vectors. Returns numpy array of scores."""
+        net = self.target_net if use_target else self.policy_net
+        with torch.no_grad():
+            net.eval()
+            t = torch.tensor(feature_batch, device=self.device)
+            scores = net(t).squeeze(1).cpu().numpy()
+        return scores
 
-    # Training step
+    # ── Memory ────────────────────────────────────────────────────────────────
+
+    def remember(self, state_features, reward, next_state_features, done):
+        self.memory.push(state_features, reward, next_state_features, done)
+
+    # ── Training step ─────────────────────────────────────────────────────────
 
     def train_step(self) -> float | None:
         """
-        Sample a batch from replay buffer and perform one gradient update.
-        Returns loss value, or None if buffer isn't full enough yet.
+        Sample a batch and train the value network.
+        Target: V(s) = reward + gamma * V_target(best_next_state)
         """
-        if len(self.memory) < BATCH_SIZE:
+        if len(self.memory) < MIN_REPLAY_SIZE:
             return None
 
-        states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
+        states, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
 
-        # Move to device
         states      = torch.tensor(states,      device=self.device)
-        actions     = torch.tensor(actions,     device=self.device)
         rewards     = torch.tensor(rewards,     device=self.device)
         next_states = torch.tensor(next_states, device=self.device)
         dones       = torch.tensor(dones,       device=self.device)
 
-        # Current Q-values for actions taken
-        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Current V(state)
+        self.policy_net.train()
+        current_v = self.policy_net(states).squeeze(1)
 
-        # Target Q-values (Bellman equation)
-        # Q_target = reward + gamma * max(Q_target_net(next_state)) * (1 - done)
+        # Target V(state) = reward + gamma * V_target(next_state) * (1 - done)
         with torch.no_grad():
-            next_q    = self.target_net(next_states).max(1).values
-            target_q  = rewards + GAMMA * next_q * (1.0 - dones)
+            next_v   = self.target_net(next_states).squeeze(1)
+            target_v = rewards + GAMMA * next_v * (1.0 - dones)
 
-        loss = self.loss_fn(current_q, target_q)
+        loss = self.loss_fn(current_v, target_v)
 
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping — prevents exploding gradients
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
@@ -163,18 +185,18 @@ class DQNAgent:
         self.losses.append(loss_val)
         return loss_val
 
-    # Epsilon decay
+    # ── Epsilon decay ─────────────────────────────────────────────────────────
 
     def decay_epsilon(self):
         self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
-        self.steps  += 1
+        self.episodes += 1
 
-    # Target network sync
+    # ── Target network sync ───────────────────────────────────────────────────
 
     def sync_target(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    # Save / load
+    # ── Save / load ───────────────────────────────────────────────────────────
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -183,7 +205,7 @@ class DQNAgent:
             "target_state_dict": self.target_net.state_dict(),
             "optimizer_state":   self.optimizer.state_dict(),
             "epsilon":           self.epsilon,
-            "steps":             self.steps,
+            "episodes":          self.episodes,
         }, path)
         print(f"Saved checkpoint → {path}")
 
@@ -192,25 +214,24 @@ class DQNAgent:
         self.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         self.target_net.load_state_dict(checkpoint["target_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        self.epsilon = checkpoint["epsilon"]
-        self.steps   = checkpoint["steps"]
+        self.epsilon  = checkpoint["epsilon"]
+        self.episodes = checkpoint.get("episodes", 0)
         print(f"Loaded checkpoint ← {path}")
 
 
-# Sanity check
+# ── Sanity check ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("Running agent sanity check...")
     agent = DQNAgent()
 
-    # Fake some experiences
-    for _ in range(100):
-        state      = np.random.rand(45).astype(np.float32)
-        action     = random.randint(0, N_ACTIONS - 1)
-        reward     = random.uniform(-1, 1)
-        next_state = np.random.rand(45).astype(np.float32)
-        done       = random.random() < 0.1
-        agent.remember(state, action, reward, next_state, done)
+    # Fake experiences
+    for _ in range(2100):
+        state      = np.random.rand(N_FEATURES).astype(np.float32)
+        reward     = random.uniform(0, 2)
+        next_state = np.random.rand(N_FEATURES).astype(np.float32)
+        done       = random.random() < 0.05
+        agent.remember(state, reward, next_state, done)
 
     loss = agent.train_step()
     print(f"Loss after first batch : {loss}")

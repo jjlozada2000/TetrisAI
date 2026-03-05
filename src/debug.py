@@ -1,25 +1,29 @@
 """
-env.py — Tetris RL Environment (Board-Evaluation Approach)
+env.py — Tetris RL Environment (Placement-Based Action Space)
 
-Instead of mapping state → 40 Q-values, the agent:
-  1. Gets the list of valid placements for the current piece
-  2. For each placement, simulates placing the piece
-  3. Extracts board features from each resulting state
-  4. The network scores each resulting state: V(next_state)
-  5. Picks the placement with the highest score
+Instead of choosing one keypress at a time, the agent chooses the FINAL
+PLACEMENT of each piece — which column and rotation to use. The environment
+then hard-drops the piece there instantly.
 
-This is MUCH easier to learn because:
-  - The network outputs 1 value (board quality) instead of 40
-  - It evaluates actual board states, not abstract action indices
-  - Board quality is a smooth, learnable function
+Why this works better:
+    - Every action = one placed piece = immediate reward feedback
+    - No sparse reward problem (agent doesn't need 30 random moves to learn)
+    - Proven approach used by most successful Tetris AIs
 
-State features per board (31 floats):
+Action space:
+    For each piece there are up to 4 rotations × 10 columns = 40 possible
+    placements. Invalid placements (piece doesn't fit) are masked out.
+    N_ACTIONS = 40
+
+State (observation) — 1D numpy array of 45 floats:
     - Column heights × 10          (normalised / ROWS)
     - Holes per column × 10        (normalised / ROWS*COLS)
     - Bumpiness × 9                (normalised / ROWS)
     - Max height × 1               (normalised / ROWS)
-    - Lines cleared × 1            (normalised / 4)
-    Total: 31
+    - Lines cleared this game × 1  (normalised / 999)
+    - Current piece one-hot × 7
+    - Next piece one-hot × 7
+    Total: 45
 """
 
 import sys
@@ -37,14 +41,38 @@ from game import (
     draw_board, draw_piece, draw_panel,
 )
 
+# ── Action space ──────────────────────────────────────────────────────────────
+
+N_ROTATIONS = 4
+N_ACTIONS   = N_ROTATIONS * COLS   # 40
+
+def action_to_placement(action: int):
+    """Convert action index → (rotation, col)."""
+    rotation = action // COLS
+    col      = action  % COLS
+    return rotation, col
+
 # ── Piece index map ───────────────────────────────────────────────────────────
 
 PIECE_KINDS = ["I", "O", "T", "S", "Z", "J", "L"]
 PIECE_IDX   = {k: i for i, k in enumerate(PIECE_KINDS)}
 
-# ── Feature size ──────────────────────────────────────────────────────────────
+# ── Reward constants ──────────────────────────────────────────────────────────
 
-N_FEATURES = 31   # heights(10) + holes(10) + bumps(9) + max_h(1) + cleared(1)
+R_SURVIVAL         =  1.0
+R_LINE_1           =  5.0
+R_LINE_2           = 15.0
+R_LINE_3           = 25.0
+R_TETRIS           = 60.0
+R_TETRIS_BONUS     = 40.0
+R_PERFECT_CLEAR    = 150.0
+R_HOLE_PENALTY     = -2.0
+R_BUMP_PENALTY     = -0.5
+R_HEIGHT_PENALTY   = -1.0
+R_DANGER_THRESHOLD = ROWS - 5
+R_DEATH            = -20.0
+
+LINE_REWARDS = {1: R_LINE_1, 2: R_LINE_2, 3: R_LINE_3, 4: R_TETRIS}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -74,15 +102,17 @@ def bumpiness(heights):
     return [abs(heights[i] - heights[i + 1]) for i in range(len(heights) - 1)]
 
 
+def one_hot(kind):
+    v = [0.0] * len(PIECE_KINDS)
+    v[PIECE_IDX[kind]] = 1.0
+    return v
+
+
 def rotate_matrix(matrix, times):
     m = [row[:] for row in matrix]
     for _ in range(times % 4):
         m = [list(row) for row in zip(*m[::-1])]
     return m
-
-
-def copy_grid(grid):
-    return [row[:] for row in grid]
 
 
 def get_valid_placements(board, piece):
@@ -92,7 +122,7 @@ def get_valid_placements(board, piece):
     """
     placements = []
     seen = set()
-    for rot in range(4):
+    for rot in range(N_ROTATIONS):
         matrix  = rotate_matrix(piece.matrix, rot)
         piece_w = len(matrix[0])
 
@@ -116,62 +146,9 @@ def get_valid_placements(board, piece):
     return placements
 
 
-def extract_features(grid, lines_cleared):
-    """
-    Extract board features from a grid state.
-    Returns a 31-float numpy array (normalised).
-    """
-    heights = board_heights(grid)
-    holes   = board_holes(grid, heights)
-    bumps   = bumpiness(heights)
-    max_h   = max(heights)
-
-    features = (
-        [h / ROWS for h in heights]           +   # 10
-        [h / (ROWS * COLS) for h in holes]    +   # 10
-        [b / ROWS for b in bumps]              +   # 9
-        [max_h / ROWS]                         +   # 1
-        [lines_cleared / 4.0]                      # 1
-    )
-    return np.array(features, dtype=np.float32)
-
-
-def simulate_placement(board, piece_matrix, col, row):
-    """
-    Simulate placing a piece on the board without modifying the original.
-    Returns (new_grid, lines_cleared).
-    """
-    grid = copy_grid(board.grid)
-
-    # Place piece
-    for r, mrow in enumerate(piece_matrix):
-        for c, val in enumerate(mrow):
-            if val:
-                ny, nx = row + r, col + c
-                if 0 <= ny < ROWS and 0 <= nx < COLS:
-                    grid[ny][nx] = (200, 200, 200)  # dummy color
-
-    # Clear lines
-    full = [i for i, grow in enumerate(grid) if all(grow)]
-    for i in full:
-        del grid[i]
-        grid.insert(0, [None] * COLS)
-
-    return grid, len(full)
-
-
 # ── Environment ───────────────────────────────────────────────────────────────
 
 class TetrisEnv:
-    """
-    Board-evaluation Tetris RL environment.
-
-    The agent doesn't pick from 40 actions. Instead:
-      1. get_next_states() returns features for every valid placement
-      2. The agent scores each one and picks the best
-      3. step(index) executes that placement
-    """
-
     def __init__(self, render: bool = False, render_fps: int = FPS):
         self.render_mode = render
         self.render_fps  = render_fps
@@ -197,71 +174,108 @@ class TetrisEnv:
         if self.render_mode:
             self._init_render()
 
-        return self._get_current_features()
+        return self._observe(), {}
 
-    def get_next_states(self):
-        """
-        For each valid placement, simulate it and return the resulting
-        board features. Returns list of (features, placement_info) tuples.
-
-        The agent should score each features array and pick the best.
-        """
-        states = []
-        for rot, col, row, matrix in self._valid_placements:
-            grid, cleared = simulate_placement(self.board, matrix, col, row)
-            features = extract_features(grid, cleared)
-            states.append((features, (rot, col, row, matrix, cleared)))
-        return states
-
-    def step(self, placement_index: int):
-        """
-        Execute the placement at the given index (from get_next_states()).
-        Returns (features, reward, done, info).
-        """
+    def step(self, action: int):
         assert not self.done, "Call reset() before stepping after game over."
 
-        if not self._valid_placements:
+        reward = 0.0
+
+        placement = self._find_placement(*action_to_placement(action))
+
+        if placement is None:
+            reward += R_DEATH
             self.done = True
-            return self._get_current_features(), -5.0, True, self._info()
+            return self._observe(), reward, self.done, self._info()
 
-        # Clamp index
-        placement_index = min(placement_index, len(self._valid_placements) - 1)
-        rot, col, row, matrix = self._valid_placements[placement_index]
+        rot, final_col, final_row, matrix = placement
 
-        # Place the piece
+        heights_before = board_heights(self.board.grid)
+        holes_before   = sum(board_holes(self.board.grid, heights_before))
+        bumps_before   = sum(bumpiness(heights_before))
+
         self.piece.matrix = matrix
-        self.piece.x      = col
-        self.piece.y      = row
+        self.piece.x      = final_col
+        self.piece.y      = final_row
         self.board.place(self.piece)
         cleared = self.board.clear_lines()
 
-        # Reward: just lines cleared (the network learns board quality directly)
-        reward = 1.0 + cleared ** 2
+        heights_after = board_heights(self.board.grid)
+        holes_after   = sum(board_holes(self.board.grid, heights_after))
+        bumps_after   = sum(bumpiness(heights_after))
+        max_h         = max(heights_after)
+
+        reward += R_SURVIVAL
+
+        if cleared > 0:
+            reward += LINE_REWARDS.get(cleared, R_TETRIS)
+            if cleared == 4 and self.piece.kind == "I":
+                reward += R_TETRIS_BONUS
+            if all(not any(row) for row in self.board.grid):
+                reward += R_PERFECT_CLEAR
+
+        new_holes = max(0, holes_after - holes_before)
+        reward += new_holes * R_HOLE_PENALTY
+
+        bump_increase = max(0, bumps_after - bumps_before)
+        reward += bump_increase * R_BUMP_PENALTY
+
+        if max_h > R_DANGER_THRESHOLD:
+            excess = max_h - R_DANGER_THRESHOLD
+            reward += excess * R_HEIGHT_PENALTY
 
         self.stats.add_lines(cleared, self.stats.level)
         self.stats.record()
 
-        # Next piece
         self.piece = self.next
         self.next  = Piece()
         self._valid_placements = get_valid_placements(self.board, self.piece)
 
         if not self._valid_placements:
+            reward += R_DEATH
             self.done = True
 
         if self.render_mode:
             self._render()
 
-        return self._get_current_features(), reward, self.done, self._info()
+        return self._observe(), reward, self.done, self._info()
+
+    def get_valid_action_mask(self):
+        mask = np.zeros(N_ACTIONS, dtype=bool)
+        for rot, col, _, _ in self._valid_placements:
+            action = rot * COLS + col
+            if action < N_ACTIONS:
+                mask[action] = True
+        return mask
 
     def close(self):
         if self._screen:
             pygame.quit()
             self._screen = None
 
-    def _get_current_features(self):
-        """Get features of the current board state."""
-        return extract_features(self.board.grid, 0)
+    def _observe(self):
+        grid    = self.board.grid
+        heights = board_heights(grid)
+        holes   = board_holes(grid, heights)
+        bumps   = bumpiness(heights)
+        max_h   = max(heights)
+        cur_oh  = one_hot(self.piece.kind)
+        nxt_oh  = one_hot(self.next.kind)
+
+        obs = (
+            [h / ROWS for h in heights]          +
+            [h / (ROWS * COLS) for h in holes]   +
+            [b / ROWS for b in bumps]             +
+            [max_h / ROWS]                        +
+            [self.stats.lines / 999]              +
+            cur_oh                                +
+            nxt_oh
+        )
+        return np.array(obs, dtype=np.float32)
+
+    @property
+    def observation_size(self):
+        return 45
 
     def _info(self):
         return {
@@ -270,6 +284,17 @@ class TetrisEnv:
             "level":  self.stats.level,
             "pieces": self.stats.pieces,
         }
+
+    def _find_placement(self, rotation, col):
+        if not self._valid_placements:
+            return None
+        for p in self._valid_placements:
+            if p[0] == rotation and p[1] == col:
+                return p
+        same_rot = [p for p in self._valid_placements if p[0] == rotation]
+        if same_rot:
+            return min(same_rot, key=lambda p: abs(p[1] - col))
+        return self._valid_placements[0]
 
     def _init_render(self):
         if self._screen:
@@ -293,9 +318,8 @@ class TetrisEnv:
         board_surf = pygame.Surface((BOARD_W, BOARD_H))
         board_surf.fill(BG)
         draw_board(board_surf, self.board)
-        if not self.done:
-            gy = self.board.ghost_y(self.piece)
-            draw_piece(board_surf, self.piece, ghost_y=gy)
+        gy = self.board.ghost_y(self.piece)
+        draw_piece(board_surf, self.piece, ghost_y=gy)
         self._screen.blit(board_surf, (0, 0))
         draw_panel(self._screen, self.stats, self.next, *self._fonts)
         pygame.display.flip()
@@ -306,25 +330,23 @@ class TetrisEnv:
 
 if __name__ == "__main__":
     import random
-    print("Running board-evaluation env sanity check...")
+    print("Running placement-based env sanity check...")
 
     env = TetrisEnv(render=False)
-    features = env.reset()
-    print(f"Feature size : {len(features)}")
-    print(f"Features     : {features}")
+    obs, _ = env.reset()
+    print(f"Observation size : {len(obs)}")
+    print(f"Action space     : {N_ACTIONS}")
 
     total_reward = 0.0
     for step in range(500):
-        next_states = env.get_next_states()
-        if not next_states:
-            break
-        # Random choice
-        idx = random.randint(0, len(next_states) - 1)
-        features, reward, done, info = env.step(idx)
+        mask   = env.get_valid_action_mask()
+        valid  = np.where(mask)[0]
+        action = int(np.random.choice(valid))
+        obs, reward, done, info = env.step(action)
         total_reward += reward
         if done:
             print(f"  Game over at step {step} | score={info['score']} lines={info['lines']} reward={total_reward:.1f}")
-            features = env.reset()
+            obs, _ = env.reset()
             total_reward = 0.0
 
     print("Sanity check passed.")
