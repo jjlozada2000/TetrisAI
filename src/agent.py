@@ -1,24 +1,31 @@
 """
-agent.py — DQN Agent for Tetris (Board-Evaluation Approach)
+agent.py — DQN Agent for Tetris (matching nuno-faria exactly)
 
-Instead of Q(state) → 40 action values, this agent:
-  1. Gets all valid placements from the environment
-  2. For each placement, gets the resulting board features
-  3. Feeds each feature vector through the network → V(next_state)
-  4. Picks the placement with the highest V(next_state)
+Replay memory stores: (current_state, next_state, reward, done)
+  - current_state: board features BEFORE the move
+  - next_state: board features AFTER the move (the state the agent chose)
+  - reward: score gained from this move
+  - done: whether the game ended
 
-Training uses the standard DQN update:
-  V(state) = reward + gamma * V(best_next_state)
+Training target (computed from replay buffer at train time):
+  if done:     target = reward
+  if not done: target = reward + discount * model(next_state)
 
-This is much easier to learn because the network only outputs 1 value
-and evaluates concrete board states rather than abstract action indices.
+This is simpler than our previous approach — no pre-computing
+"best future state", just the state that actually resulted.
+
+Hyperparameters matched to nuno-faria / ChesterHuynh:
+  - mem_size: 20000
+  - batch_size: 512
+  - discount: 0.95
+  - lr: 1e-3
+  - epsilon: linear decay to 0 at 75% of episodes
+  - epochs: 1 (train once per episode)
 """
 
-import os
-import sys
+import os, sys, random
 sys.path.insert(0, os.path.dirname(__file__))
 
-import random
 import numpy as np
 from collections import deque
 
@@ -27,62 +34,22 @@ import torch.nn as nn
 import torch.optim as optim
 
 from model import TetrisNet
-from env import N_FEATURES
 
-
-# ── Hyperparameters ───────────────────────────────────────────────────────────
-
-BATCH_SIZE       = 512      # larger batches — more stable gradients
-GAMMA            = 0.99     # higher discount — long-term planning matters in Tetris
-LR               = 1e-3     # can be higher since network is smaller (31→64→64→1)
-MEMORY_SIZE      = 30_000   # replay buffer size
-EPSILON_START    = 1.0      # start fully random
-EPSILON_MIN      = 0.001    # very low — the network should handle exploration via scoring
-EPSILON_DECAY    = 0.999    # per episode
-TARGET_UPDATE    = 500      # sync target network every N episodes
-MIN_REPLAY_SIZE  = 2000     # fill buffer before training
-
-
-# ── Replay Buffer ─────────────────────────────────────────────────────────────
-
-class ReplayBuffer:
-    """
-    Stores (state_features, reward, next_state_features, done).
-    state_features: the features of the board state the agent chose.
-    next_state_features: the features of the best next state (after next piece).
-    """
-
-    def __init__(self, capacity: int = MEMORY_SIZE):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, reward, next_state, done):
-        self.buffer.append((state, reward, next_state, done))
-
-    def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, batch_size)
-        states, rewards, next_states, dones = zip(*batch)
-        return (
-            np.array(states,      dtype=np.float32),
-            np.array(rewards,     dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
-            np.array(dones,       dtype=np.float32),
-        )
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ── DQN Agent ─────────────────────────────────────────────────────────────────
 
 class DQNAgent:
-    """
-    Board-evaluation DQN agent.
-
-    Evaluates each possible placement by scoring the resulting board state.
-    Picks the placement with the highest score (with epsilon-greedy exploration).
-    """
-
-    def __init__(self, device: str = None):
+    def __init__(
+        self,
+        state_size=4,
+        discount=0.95,
+        replay_size=20000,
+        replay_start_size=None,
+        epsilon=1.0,
+        epsilon_min=0.0,
+        epsilon_stop_episode=1500,
+        batch_size=512,
+        epochs=1,
+        device=None,
+    ):
         if device is None:
             if torch.backends.mps.is_available():
                 device = "mps"
@@ -93,153 +60,116 @@ class DQNAgent:
         self.device = torch.device(device)
         print(f"Using device: {self.device}")
 
-        # Two networks — policy learns, target provides stable targets
-        self.policy_net = TetrisNet(N_FEATURES).to(self.device)
-        self.target_net = TetrisNet(N_FEATURES).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
+        self.state_size = state_size
+        self.discount = discount
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_stop_episode = epsilon_stop_episode
+        self.epsilon_decay = (epsilon - epsilon_min) / epsilon_stop_episode
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.episode = 0
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
-        self.loss_fn   = nn.MSELoss()
+        self.replay_start_size = replay_start_size or (batch_size * 2)
+        self.memory = deque(maxlen=replay_size)
 
-        self.memory    = ReplayBuffer(MEMORY_SIZE)
+        self.model = TetrisNet(state_size).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.loss_fn = nn.MSELoss()
 
-        self.epsilon   = EPSILON_START
-        self.episodes  = 0
-        self.losses    = []
-
-    # ── Action selection ──────────────────────────────────────────────────────
-
-    def select_best(self, next_states):
+    def best_state(self, states):
         """
-        Given a list of (features, placement_info) from env.get_next_states(),
-        return the index of the best placement.
-
-        With probability epsilon, picks randomly (exploration).
-        Otherwise, scores each state with the policy network and picks the best.
+        Given list of (state_array, placement_info), pick the best one.
+        Epsilon-greedy: random with probability epsilon, else network's best.
+        Returns (index, state_array).
         """
-        if not next_states:
-            return 0
+        if not states:
+            return 0, np.zeros(self.state_size, dtype=np.float32)
 
         if random.random() < self.epsilon:
-            return random.randint(0, len(next_states) - 1)
+            idx = random.randint(0, len(states) - 1)
+            return idx, states[idx][0]
 
-        # Score all candidate states in one batch
-        feature_batch = np.array([s[0] for s in next_states], dtype=np.float32)
+        batch = np.array([s[0] for s in states], dtype=np.float32)
         with torch.no_grad():
-            self.policy_net.eval()
-            t = torch.tensor(feature_batch, device=self.device)
-            scores = self.policy_net(t).squeeze(1).cpu().numpy()
-            self.policy_net.train()
+            self.model.eval()
+            scores = self.model(torch.tensor(batch, device=self.device))
+            scores = scores.squeeze(1).cpu().numpy()
+            self.model.train()
 
-        return int(np.argmax(scores))
+        idx = int(np.argmax(scores))
+        return idx, states[idx][0]
 
-    def score_states(self, feature_batch, use_target=False):
-        """Score a batch of feature vectors. Returns numpy array of scores."""
-        net = self.target_net if use_target else self.policy_net
-        with torch.no_grad():
-            net.eval()
-            t = torch.tensor(feature_batch, device=self.device)
-            scores = net(t).squeeze(1).cpu().numpy()
-        return scores
+    def add_to_memory(self, current_state, next_state, reward, done):
+        """Store transition. current_state and next_state are numpy arrays."""
+        self.memory.append((current_state, next_state, reward, done))
 
-    # ── Memory ────────────────────────────────────────────────────────────────
-
-    def remember(self, state_features, reward, next_state_features, done):
-        self.memory.push(state_features, reward, next_state_features, done)
-
-    # ── Training step ─────────────────────────────────────────────────────────
-
-    def train_step(self) -> float | None:
+    def train(self):
         """
-        Sample a batch and train the value network.
-        Target: V(s) = reward + gamma * V_target(best_next_state)
+        Train once on a batch from replay memory.
+        Called ONCE PER EPISODE.
         """
-        if len(self.memory) < MIN_REPLAY_SIZE:
+        if len(self.memory) < self.replay_start_size:
             return None
 
-        states, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
+        total_loss = 0.0
+        for _ in range(self.epochs):
+            batch = random.sample(self.memory, min(self.batch_size, len(self.memory)))
+            current_states, next_states, rewards, dones = zip(*batch)
 
-        states      = torch.tensor(states,      device=self.device)
-        rewards     = torch.tensor(rewards,     device=self.device)
-        next_states = torch.tensor(next_states, device=self.device)
-        dones       = torch.tensor(dones,       device=self.device)
+            current_states = torch.tensor(np.array(current_states, dtype=np.float32), device=self.device)
+            next_states    = torch.tensor(np.array(next_states, dtype=np.float32), device=self.device)
+            rewards        = torch.tensor(np.array(rewards, dtype=np.float32), device=self.device)
+            dones          = torch.tensor(np.array(dones, dtype=np.float32), device=self.device)
 
-        # Current V(state)
-        self.policy_net.train()
-        current_v = self.policy_net(states).squeeze(1)
+            # Target: reward + discount * V(next_state) if not done, else just reward
+            self.model.eval()
+            with torch.no_grad():
+                next_v = self.model(next_states).squeeze(1)
+            self.model.train()
 
-        # Target V(state) = reward + gamma * V_target(next_state) * (1 - done)
-        with torch.no_grad():
-            next_v   = self.target_net(next_states).squeeze(1)
-            target_v = rewards + GAMMA * next_v * (1.0 - dones)
+            targets = rewards + self.discount * next_v * (1.0 - dones)
 
-        loss = self.loss_fn(current_v, target_v)
+            # Prediction: V(current_state)
+            predictions = self.model(current_states).squeeze(1)
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-        self.optimizer.step()
+            loss = self.loss_fn(predictions, targets)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-        loss_val = loss.item()
-        self.losses.append(loss_val)
-        return loss_val
+            total_loss += loss.item()
 
-    # ── Epsilon decay ─────────────────────────────────────────────────────────
+        return total_loss / self.epochs
 
     def decay_epsilon(self):
-        self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
-        self.episodes += 1
+        self.episode += 1
+        self.epsilon = max(self.epsilon_min, self.epsilon - self.epsilon_decay)
 
-    # ── Target network sync ───────────────────────────────────────────────────
-
-    def sync_target(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-
-    # ── Save / load ───────────────────────────────────────────────────────────
-
-    def save(self, path: str):
+    def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
-            "policy_state_dict": self.policy_net.state_dict(),
-            "target_state_dict": self.target_net.state_dict(),
-            "optimizer_state":   self.optimizer.state_dict(),
-            "epsilon":           self.epsilon,
-            "episodes":          self.episodes,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epsilon": self.epsilon,
+            "episode": self.episode,
         }, path)
-        print(f"Saved checkpoint → {path}")
 
-    def load(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint["policy_state_dict"])
-        self.target_net.load_state_dict(checkpoint["target_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        self.epsilon  = checkpoint["epsilon"]
-        self.episodes = checkpoint.get("episodes", 0)
-        print(f"Loaded checkpoint ← {path}")
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.epsilon = ckpt["epsilon"]
+        self.episode = ckpt.get("episode", 0)
+        print(f"Loaded ← {path} (ep={self.episode}, ε={self.epsilon:.3f})")
 
-
-# ── Sanity check ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Running agent sanity check...")
+    print("Agent sanity check...")
     agent = DQNAgent()
-
-    # Fake experiences
-    for _ in range(2100):
-        state      = np.random.rand(N_FEATURES).astype(np.float32)
-        reward     = random.uniform(0, 2)
-        next_state = np.random.rand(N_FEATURES).astype(np.float32)
-        done       = random.random() < 0.05
-        agent.remember(state, reward, next_state, done)
-
-    loss = agent.train_step()
-    print(f"Loss after first batch : {loss}")
-
-    agent.decay_epsilon()
-    print(f"Epsilon after decay    : {agent.epsilon:.4f}")
-
-    agent.save("../models/test_checkpoint.pt")
-    agent.load("../models/test_checkpoint.pt")
-
-    print("agent.py sanity check passed.")
+    for _ in range(1100):
+        s = np.random.rand(4).astype(np.float32)
+        agent.add_to_memory(s, np.random.rand(4).astype(np.float32), 1.0, False)
+    loss = agent.train()
+    print(f"Loss: {loss:.4f}")
+    print("OK")
