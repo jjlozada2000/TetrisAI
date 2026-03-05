@@ -1,33 +1,25 @@
 """
-env.py — Tetris Environment (nuno-faria style)
+env.py — Tetris Environment
 
-Based on the proven approach from github.com/nuno-faria/tetris-ai (800K+ points).
+Closely follows nuno-faria/tetris-ai and vietnh1009/Tetris-deep-Q-learning-pytorch.
 
-Key design decisions:
-  - State = only 4 features: lines_cleared, holes, bumpiness, total_height
-  - get_next_states() returns {action: state} for ALL valid placements
-  - Reward = 1 per piece placed + lines_cleared^2 * board_width
-  - The agent scores each resulting state and picks the best one
+State = [lines_cleared, holes, total_bumpiness, total_height]
+get_next_states() returns dict: {(col, rotation): [lines, holes, bumps, height]}
+Reward = 1 + (lines_cleared ** 2) * board_width
 """
 
-import sys, os
+import sys, os, copy, random
 sys.path.insert(0, os.path.dirname(__file__))
 
-import copy
 import numpy as np
 import pygame
 
 from game import (
-    Board, Piece, Stats,
+    Board, Piece, Stats, TETROMINOES, PIECE_COLORS,
     COLS, ROWS, CELL, BOARD_W, BOARD_H, PANEL_W, WINDOW_W, WINDOW_H,
-    BG, FPS,
-    draw_board, draw_piece, draw_panel,
+    BG, FPS, draw_board, draw_piece, draw_panel,
 )
 
-PIECE_KINDS = ["I", "O", "T", "S", "Z", "J", "L"]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def rotate_matrix(matrix, times):
     m = [row[:] for row in matrix]
@@ -36,192 +28,171 @@ def rotate_matrix(matrix, times):
     return m
 
 
-def copy_grid(grid):
-    return [row[:] for row in grid]
+def check_valid(grid, matrix, col, row):
+    for r, mrow in enumerate(matrix):
+        for c, val in enumerate(mrow):
+            if val:
+                nx, ny = col + c, row + r
+                if nx < 0 or nx >= COLS or ny >= ROWS:
+                    return False
+                if ny >= 0 and grid[ny][nx]:
+                    return False
+    return True
 
 
 def get_col_heights(grid):
     heights = []
     for c in range(COLS):
-        h = 0
         for r in range(ROWS):
             if grid[r][c]:
-                h = ROWS - r
+                heights.append(ROWS - r)
                 break
-        heights.append(h)
+        else:
+            heights.append(0)
     return heights
 
 
 def count_holes(grid):
     holes = 0
     for c in range(COLS):
-        found_block = False
+        block_found = False
         for r in range(ROWS):
             if grid[r][c]:
-                found_block = True
-            elif found_block:
+                block_found = True
+            elif block_found:
                 holes += 1
     return holes
 
 
-def get_bumpiness(heights):
-    total = 0
-    for i in range(len(heights) - 1):
-        total += abs(heights[i] - heights[i + 1])
-    return total
-
-
-def get_state_props(grid):
-    """
-    Extract the 4 features that matter (proven by nuno-faria):
-      - lines_cleared (will be added by caller)
-      - holes
-      - bumpiness
-      - total_height
-    Returns [holes, bumpiness, total_height] — caller adds lines_cleared.
-    """
+def get_bumpiness_and_height(grid):
     heights = get_col_heights(grid)
-    return [
-        count_holes(grid),
-        get_bumpiness(heights),
-        sum(heights),
-    ]
+    total_height = sum(heights)
+    bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
+    return bumpiness, total_height
 
-
-def get_valid_placements(board, piece):
-    """Get all valid (rotation, col) placements."""
-    placements = []
-    seen = set()
-    for rot in range(4):
-        matrix = rotate_matrix(piece.matrix, rot)
-        pw = len(matrix[0])
-        for col in range(COLS - pw + 1):
-            test = copy.deepcopy(piece)
-            test.matrix = matrix
-            test.x = col
-            test.y = 0
-            if not board.valid(test):
-                continue
-            while board.valid(test, oy=1):
-                test.y += 1
-            key = (rot, col)
-            if key not in seen:
-                seen.add(key)
-                placements.append((rot, col, test.y, matrix))
-    return placements
-
-
-# ── Environment ───────────────────────────────────────────────────────────────
 
 class TetrisEnv:
-    """
-    Tetris environment following nuno-faria's proven architecture.
-
-    Flow per step:
-      1. Call get_next_states() → dict of {index: [lines, holes, bumps, height]}
-      2. Agent picks the best index
-      3. Call step(index) → reward, done, info
-    """
-
     def __init__(self, render=False, render_fps=FPS):
         self.render_mode = render
-        self.render_fps  = render_fps
+        self.render_fps = render_fps
         self._screen = None
-        self._clock  = None
-        self._fonts  = None
+        self._clock = None
+        self._fonts = None
         self.board = None
         self.stats = None
         self.piece = None
-        self.next  = None
-        self.done  = False
-        self._placements = []
+        self.next = None
+        self.done = False
+
+    @staticmethod
+    def get_state_size():
+        return 4
 
     def reset(self):
         self.board = Board()
         self.stats = Stats()
         self.piece = Piece()
-        self.next  = Piece()
-        self.done  = False
-        self._placements = get_valid_placements(self.board, self.piece)
+        self.next = Piece()
+        self.done = False
         if self.render_mode:
             self._init_render()
-        return self._get_state()
+        return self._get_board_props(self.board.grid, 0)
 
-    def get_state_size(self):
-        return 4  # lines_cleared, holes, bumpiness, total_height
-
-    def _get_state(self):
-        """Current board state features."""
-        props = get_state_props(self.board.grid)
-        return np.array([0] + props, dtype=np.float32)  # 0 lines cleared for current state
+    def _get_board_props(self, grid, lines_cleared):
+        holes = count_holes(grid)
+        bumpiness, total_height = get_bumpiness_and_height(grid)
+        return np.array([lines_cleared, holes, bumpiness, total_height], dtype=np.float32)
 
     def get_next_states(self):
         """
-        For each valid placement, simulate it and return the resulting
-        4-feature state. Returns list of (state_array, placement_tuple).
+        Returns dict: {(col, rotation): state_properties}
+        where state_properties = [lines_cleared, holes, bumpiness, total_height]
         """
-        states = []
-        for rot, col, row, matrix in self._placements:
-            # Simulate placement
-            grid = copy_grid(self.board.grid)
-            for r, mrow in enumerate(matrix):
-                for c, val in enumerate(mrow):
-                    if val:
-                        ny, nx = row + r, col + c
-                        if 0 <= ny < ROWS and 0 <= nx < COLS:
-                            grid[ny][nx] = (200, 200, 200)
+        states = {}
+        piece_matrix = self.piece.matrix
 
-            # Clear lines
-            full = [i for i, grow in enumerate(grid) if all(grow)]
-            for i in full:
-                del grid[i]
-                grid.insert(0, [None] * COLS)
-            cleared = len(full)
+        for rot in range(4):
+            rotated = rotate_matrix(piece_matrix, rot)
+            pw = len(rotated[0])
 
-            # Extract 4 features
-            props = get_state_props(grid)
-            state = np.array([cleared] + props, dtype=np.float32)
-            states.append((state, (rot, col, row, matrix, cleared)))
+            for col in range(COLS - pw + 1):
+                # Check if piece fits at top
+                if not check_valid(self.board.grid, rotated, col, 0):
+                    continue
+
+                # Drop to bottom
+                row = 0
+                while check_valid(self.board.grid, rotated, col, row + 1):
+                    row += 1
+
+                # Simulate placement
+                grid = [r[:] for r in self.board.grid]
+                for r, mrow in enumerate(rotated):
+                    for c, val in enumerate(mrow):
+                        if val:
+                            ny, nx = row + r, col + c
+                            if 0 <= ny < ROWS and 0 <= nx < COLS:
+                                grid[ny][nx] = (200, 200, 200)
+
+                # Clear lines
+                lines_cleared = 0
+                r = ROWS - 1
+                while r >= 0:
+                    if all(grid[r]):
+                        del grid[r]
+                        grid.insert(0, [None] * COLS)
+                        lines_cleared += 1
+                    else:
+                        r -= 1
+
+                state = self._get_board_props(grid, lines_cleared)
+                states[(col, rot)] = (state, rotated, col, row, lines_cleared)
 
         return states
 
-    def step(self, placement_index):
-        """Execute the placement and return (reward, done, info)."""
-        assert not self.done
+    def step(self, action_key, render=False):
+        """
+        Execute a placement. action_key is (col, rotation) from get_next_states().
+        Returns (state_properties, reward, done, info).
+        """
+        next_states = self.get_next_states()
 
-        if not self._placements:
-            self.done = True
-            return -1, True, self._info()
+        if action_key not in next_states:
+            # Fallback: pick a random valid action
+            if next_states:
+                action_key = random.choice(list(next_states.keys()))
+            else:
+                self.done = True
+                return self._get_board_props(self.board.grid, 0), -1, True, self._info()
 
-        idx = min(placement_index, len(self._placements) - 1)
-        rot, col, row, matrix = self._placements[idx]
+        state, rotated, col, row, lines_cleared = next_states[action_key]
 
-        # Place piece
-        self.piece.matrix = matrix
+        # Place piece on actual board
+        self.piece.matrix = rotated
         self.piece.x = col
         self.piece.y = row
         self.board.place(self.piece)
-        cleared = self.board.clear_lines()
+        self.board.clear_lines()
 
-        # Reward: 1 per piece + lines^2 * width (nuno-faria's formula)
-        reward = 1 + (cleared ** 2) * COLS
+        # Reward: nuno-faria formula
+        reward = 1 + (lines_cleared ** 2) * COLS
 
-        self.stats.add_lines(cleared, self.stats.level)
+        self.stats.add_lines(lines_cleared, self.stats.level)
         self.stats.record()
 
         # Next piece
         self.piece = self.next
         self.next = Piece()
-        self._placements = get_valid_placements(self.board, self.piece)
 
-        if not self._placements:
+        # Check game over
+        if not self.get_next_states():
             self.done = True
-            reward -= 1  # death penalty
+            reward -= 1
 
-        if self.render_mode:
+        if self.render_mode or render:
             self._render()
 
-        return reward, self.done, self._info()
+        return state, reward, self.done, self._info()
 
     def _info(self):
         return {
@@ -241,7 +212,7 @@ class TetrisEnv:
             return
         pygame.init()
         self._screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-        pygame.display.set_caption("Tetris RL — Training")
+        pygame.display.set_caption("Tetris RL")
         self._clock = pygame.time.Clock()
         self._fonts = (
             pygame.font.SysFont("menlo", 28, bold=True),
@@ -250,6 +221,8 @@ class TetrisEnv:
         )
 
     def _render(self):
+        if not self._screen:
+            self._init_render()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.close()
@@ -268,20 +241,20 @@ class TetrisEnv:
 
 
 if __name__ == "__main__":
-    import random
-    print("Running env sanity check...")
+    print("Env sanity check...")
     env = TetrisEnv()
-    env.reset()
+    state = env.reset()
+    print(f"State size: {len(state)}, state: {state}")
     total = 0
-    for step in range(500):
-        states = env.get_next_states()
-        if not states:
+    for i in range(500):
+        ns = env.get_next_states()
+        if not ns:
             break
-        idx = random.randint(0, len(states) - 1)
-        reward, done, info = env.step(idx)
+        key = random.choice(list(ns.keys()))
+        state, reward, done, info = env.step(key)
         total += reward
         if done:
-            print(f"  Game over at step {step} | score={info['score']} lines={info['lines']} reward={total:.0f}")
-            env.reset()
+            print(f"  Game over step {i}: score={info['score']} lines={info['lines']} reward={total:.0f}")
+            state = env.reset()
             total = 0
-    print("Sanity check passed.")
+    print("OK")

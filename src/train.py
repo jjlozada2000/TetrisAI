@@ -1,111 +1,185 @@
 """
-train.py — DQN Training (nuno-faria exact match)
+train.py — DQN Training for Tetris
 
-3000 episodes, epsilon linear decay stops at episode 2000.
-Once the agent consistently plays long games (500+ pieces),
-it has effectively learned to play indefinitely.
+Closely follows vietnh1009/Tetris-deep-Q-learning-pytorch (522 stars).
 
-Usage:
-    python3 src/train.py
-    python3 src/train.py --render
-    python3 src/train.py --resume
+Key design (proven to achieve infinite play):
+  - replay_memory stores (state, reward, next_state, done) tuples
+  - Each step: get_next_states(), pick best (ε-greedy), execute, store transition
+  - Each episode end: sample batch, compute targets AT TRAIN TIME:
+      target = reward                              if done
+      target = reward + gamma * model(next_state)  if not done
+  - Train model to predict: model(state) ≈ target
+  
+Hyperparameters (vietnh1009):
+  - batch_size: 512
+  - lr: 1e-3
+  - gamma: 0.99
+  - replay_memory_size: 30000
+  - initial_epsilon: 1.0
+  - final_epsilon: 1e-3
+  - num_decay_epochs: 2000
+  - num_epochs: 3000
 """
 
-import os, sys, argparse, time, datetime
+import os, sys, argparse, time, datetime, random
 sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
-from env import TetrisEnv
-from agent import DQNAgent
+from collections import deque
 
-EPISODES       = 3000
-MAX_STEPS      = None       # no limit — let the agent play as long as it can
-LOG_EVERY      = 10
-SAVE_LATEST    = 50
-SAVE_EVERY     = 500
-RENDER_EVERY   = 50
-RENDER_FPS     = 30
+import torch
+import torch.nn as nn
+
+from env import TetrisEnv
+from model import DeepQNetwork
+
+# ── Hyperparameters (matching vietnh1009) ─────────────────────────────────────
+
+BATCH_SIZE         = 512
+LR                 = 1e-3
+GAMMA              = 0.99
+REPLAY_SIZE        = 30000
+INITIAL_EPSILON    = 1.0
+FINAL_EPSILON      = 1e-3
+NUM_DECAY_EPOCHS   = 2000
+NUM_EPOCHS         = 3000
+SAVE_INTERVAL      = 500
+LOG_EVERY          = 10
+
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 RUNS_DIR       = os.path.join(os.path.dirname(__file__), "..", "runs")
 BEST_PATH      = os.path.join(CHECKPOINT_DIR, "best.pt")
 LATEST_PATH    = os.path.join(CHECKPOINT_DIR, "latest.pt")
 
 
-class Logger:
-    def __init__(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.file = open(path, "w", buffering=1)
-        self.file.write("episode,score,lines,pieces,reward,epsilon,loss\n")
-        print(f"Logging to: {path}\n")
-
-    def write(self, ep, score, lines, pieces, reward, epsilon, loss):
-        self.file.write(f"{ep},{score},{lines},{pieces},{reward:.1f},{epsilon:.4f},{loss:.5f}\n")
-
-    def close(self):
-        self.file.close()
-
-
 def train(render=False, resume=False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(RUNS_DIR, exist_ok=True)
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    logger = Logger(os.path.join(RUNS_DIR, f"train_{ts}.log"))
+    # Device
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
 
-    env = TetrisEnv(render=False, render_fps=RENDER_FPS)
-    agent = DQNAgent(
-        state_size=env.get_state_size(),
-        epsilon_stop_episode=2000,   # nuno-faria: epsilon=0 at ep 2000
-        replay_size=1000,            # nuno-faria: small buffer
-        batch_size=128,              # nuno-faria: 128
-        replay_start_size=128,
-        epochs=1,
-        discount=0.95,
-    )
+    # Environment and model
+    env = TetrisEnv(render=False)
+    model = DeepQNetwork().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.MSELoss()
 
+    # Replay memory
+    replay_memory = deque(maxlen=REPLAY_SIZE)
+
+    # Epsilon schedule (linear decay)
+    epsilon = INITIAL_EPSILON
+
+    # Resume
+    start_epoch = 0
     if resume and os.path.exists(LATEST_PATH):
-        agent.load(LATEST_PATH)
+        ckpt = torch.load(LATEST_PATH, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        epsilon = ckpt.get("epsilon", INITIAL_EPSILON)
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"Resumed from epoch {start_epoch}, ε={epsilon:.4f}")
+
+    # Logging
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(RUNS_DIR, f"train_{ts}.log")
+    log_file = open(log_path, "w", buffering=1)
+    log_file.write("epoch,score,lines,pieces,reward,epsilon,loss\n")
+    print(f"Logging to: {log_path}")
+    print(f"Training for {NUM_EPOCHS} epochs, ε decay ends at {NUM_DECAY_EPOCHS}\n")
 
     best_score = 0
     recent_scores = []
 
-    print(f"Training for {EPISODES} episodes")
-    print(f"Epsilon will reach 0 at episode 2000\n")
-
-    for ep in range(1, EPISODES + 1):
-        if render and ep % RENDER_EVERY == 0:
-            env.render_mode = True
-            env._init_render()
-        else:
-            env.render_mode = False
-
+    for epoch in range(start_epoch, NUM_EPOCHS):
         current_state = env.reset()
         done = False
         ep_reward = 0
         steps = 0
         t0 = time.time()
 
-        while not done and (MAX_STEPS is None or steps < MAX_STEPS):
+        # ── Play one full game ────────────────────────────────────────────────
+        while not done:
             next_states = env.get_next_states()
             if not next_states:
                 break
 
-            best_idx, best_state = agent.best_state(next_states)
+            # Epsilon-greedy action selection
+            if random.random() < epsilon:
+                action_key = random.choice(list(next_states.keys()))
+            else:
+                # Score all next states, pick the best
+                action_keys = list(next_states.keys())
+                state_arrays = np.array([next_states[k][0] for k in action_keys], dtype=np.float32)
+                with torch.no_grad():
+                    model.eval()
+                    predictions = model(torch.tensor(state_arrays, device=device)).squeeze(1)
+                    model.train()
+                best_idx = torch.argmax(predictions).item()
+                action_key = action_keys[best_idx]
 
-            reward, done, info = env.step(best_idx)
+            # The state we're about to transition to
+            next_state = next_states[action_key][0]
+
+            # Execute
+            _, reward, done, info = env.step(action_key, render=(render and epoch % 50 == 0))
             ep_reward += reward
             steps += 1
 
-            agent.add_to_memory(current_state, best_state, reward, done)
-            current_state = best_state
+            # Store transition: (current_state, reward, next_state, done)
+            replay_memory.append((current_state, reward, next_state, done))
 
-        loss = agent.train()
-        agent.decay_epsilon()
+            # Advance
+            current_state = next_state
 
+        # ── Train at end of episode ───────────────────────────────────────────
+        loss_val = 0.0
+        if len(replay_memory) >= BATCH_SIZE // 2:
+            batch = random.sample(replay_memory, min(BATCH_SIZE, len(replay_memory)))
+            
+            batch_states = torch.tensor(
+                np.array([t[0] for t in batch], dtype=np.float32), device=device)
+            batch_rewards = torch.tensor(
+                np.array([t[1] for t in batch], dtype=np.float32), device=device)
+            batch_next_states = torch.tensor(
+                np.array([t[2] for t in batch], dtype=np.float32), device=device)
+            batch_dones = torch.tensor(
+                np.array([t[3] for t in batch], dtype=np.float32), device=device)
+
+            # Compute targets AT TRAIN TIME (not pre-computed)
+            model.eval()
+            with torch.no_grad():
+                next_predictions = model(batch_next_states).squeeze(1)
+            model.train()
+
+            # target = reward if done, else reward + gamma * V(next_state)
+            targets = batch_rewards + GAMMA * next_predictions * (1 - batch_dones)
+
+            # Predict current state values
+            predictions = model(batch_states).squeeze(1)
+
+            loss = loss_fn(predictions, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            loss_val = loss.item()
+
+        # ── Epsilon decay (linear) ────────────────────────────────────────────
+        epsilon = max(FINAL_EPSILON,
+                      INITIAL_EPSILON - (INITIAL_EPSILON - FINAL_EPSILON) * (epoch + 1) / NUM_DECAY_EPOCHS)
+
+        # ── Logging ───────────────────────────────────────────────────────────
         score = info["score"]
         lines = info["lines"]
         pieces = info.get("pieces", 0)
-        loss_val = loss if loss is not None else 0.0
 
         recent_scores.append(score)
         if len(recent_scores) > 50:
@@ -113,32 +187,51 @@ def train(render=False, resume=False):
 
         if score > best_score:
             best_score = score
-            agent.save(BEST_PATH)
+            torch.save(model.state_dict(), BEST_PATH)
 
-        if ep % SAVE_EVERY == 0:
-            agent.save(os.path.join(CHECKPOINT_DIR, f"checkpoint_ep{ep}.pt"))
-        if ep % SAVE_LATEST == 0:
-            agent.save(LATEST_PATH)
+        if (epoch + 1) % SAVE_INTERVAL == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epsilon": epsilon,
+                "epoch": epoch + 1,
+            }, os.path.join(CHECKPOINT_DIR, f"checkpoint_ep{epoch+1}.pt"))
 
-        logger.write(ep, score, lines, pieces, ep_reward, agent.epsilon, loss_val)
+        if (epoch + 1) % 50 == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epsilon": epsilon,
+                "epoch": epoch + 1,
+            }, LATEST_PATH)
 
-        if ep % LOG_EVERY == 0:
+        log_file.write(f"{epoch+1},{score},{lines},{pieces},{ep_reward:.1f},{epsilon:.4f},{loss_val:.5f}\n")
+
+        if (epoch + 1) % LOG_EVERY == 0:
             dt = time.time() - t0
             bar_len = 20
-            filled = int(bar_len * ep / EPISODES)
+            filled = int(bar_len * (epoch + 1) / NUM_EPOCHS)
             bar = "█" * filled + "░" * (bar_len - filled)
-            pct = 100 * ep / EPISODES
+            pct = 100 * (epoch + 1) / NUM_EPOCHS
             avg50 = np.mean(recent_scores) if recent_scores else 0
             print(
                 f"[{bar}] {pct:5.1f}%  "
-                f"ep={ep:>5}  score={score:>7}  best={best_score:>7}  "
+                f"ep={epoch+1:>5}  score={score:>7}  best={best_score:>7}  "
                 f"avg50={avg50:>7.0f}  lines={lines:>4}  pieces={pieces:>4}  "
-                f"ε={agent.epsilon:.3f}  loss={loss_val:.4f}  t={dt:.1f}s"
+                f"ε={epsilon:.3f}  loss={loss_val:.4f}  t={dt:.1f}s"
             )
 
-    agent.save(LATEST_PATH)
+    # Save final
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epsilon": epsilon,
+        "epoch": NUM_EPOCHS,
+    }, LATEST_PATH)
+    torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "final.pt"))
+
     print(f"\nDone. Best score: {best_score}")
-    logger.close()
+    log_file.close()
     env.close()
 
 
