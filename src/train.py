@@ -173,4 +173,7 @@ if __name__ == "__main__":
                         help="Resume training from the latest checkpoint.")
     args = parser.parse_args()
 
-    train(render=args.render, resume=args.resume)
+    try:
+        train(render=args.render, resume=args.resume)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Progress saved to models/latest.pt")

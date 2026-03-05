@@ -67,6 +67,7 @@ R_TSPIN_SINGLE      =  4.0
 R_TSPIN_DOUBLE      = 10.0
 R_TSPIN_TRIPLE      = 20.0    # rare but possible
 R_TWIST_BONUS       =  2.0    # non-T piece twist/kick bonus
+R_HARD_DROP_CELL    =  0.02   # per cell dropped via hard drop (rewards decisiveness)
 R_HOLE_PENALTY      = -0.5    # per hole created
 R_HEIGHT_PENALTY    = -0.2    # per row above danger threshold
 R_DANGER_THRESHOLD  = ROWS - 5  # 15 rows — start penalizing here
@@ -161,7 +162,9 @@ class TetrisEnv:
         self.piece  = None
         self.next   = None
         self.done   = False
-        self._last_tspin = False   # was the last rotation a T-spin?
+        self._last_tspin  = False   # was the last rotation a T-spin?
+        self._land_steps  = 0       # steps spent sitting on ground
+        self._LOCK_STEPS  = 30      # ~0.5s at 60fps — standard Tetris lock delay
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -173,6 +176,7 @@ class TetrisEnv:
         self.next  = Piece()
         self.done  = False
         self._last_tspin = False
+        self._land_steps = 0
 
         if self.render_mode:
             self._init_render()
@@ -229,19 +233,39 @@ class TetrisEnv:
                 placed = True
 
         elif act == "hard_drop":
+            cells_dropped = 0
             while self.board.valid(self.piece, oy=1):
                 self.piece.y += 1
+                cells_dropped += 1
+            reward += cells_dropped * R_HARD_DROP_CELL
             placed = True
 
         elif act == "nothing":
             # Natural gravity tick
             if self.board.valid(self.piece, oy=1):
                 self.piece.y += 1
+                self._land_steps = 0   # reset lock timer — still falling
             else:
                 placed = True
 
-        # ── Lock piece if it landed ───────────────────────────────────────────
-        if placed or (not self.board.valid(self.piece, oy=1) and act not in ("rotate", "left", "right")):
+        # ── Lock delay — piece must sit on ground for _LOCK_STEPS before locking ──
+        # Hard drop bypasses this (placed=True already set above).
+        # Moves/rotations while grounded reset the counter (standard Tetris rule).
+        if not placed:
+            grounded = not self.board.valid(self.piece, oy=1)
+            if grounded:
+                if act in ("left", "right", "rotate"):
+                    self._land_steps = 0   # player acted — reset lock timer
+                else:
+                    self._land_steps += 1
+                if self._land_steps >= self._LOCK_STEPS:
+                    placed = True
+                    self._land_steps = 0
+            else:
+                self._land_steps = 0
+
+        # ── Place piece and compute rewards when locked ───────────────────────
+        if placed:
             holes_before = sum(board_holes(self.board.grid,
                                            board_heights(self.board.grid)))
 
