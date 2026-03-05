@@ -12,7 +12,7 @@ from agent import DQNAgent, TARGET_UPDATE
 
 #  Config 
 
-EPISODES         = 5_000     # total training episodes
+EPISODES         = 10_000     # total training episodes
 SAVE_EVERY       = 250       # save checkpoint every N episodes
 LOG_EVERY        = 10        # log summary every N episodes
 RENDER_FPS       = 30        # FPS when --render is on
