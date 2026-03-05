@@ -1,28 +1,8 @@
-"""
-model.py — Neural Network for Tetris DQN
-
-Architecture: 3-layer fully connected network
-    Input:  45 features (board state)
-    Hidden: 256 → 128 neurons with ReLU + Dropout
-    Output: 6 Q-values (one per action)
-
-The network learns to predict: "given this board state,
-how much future reward can I expect from each action?"
-The agent then picks the action with the highest Q-value.
-"""
-
 import torch
 import torch.nn as nn
 
 
 class TetrisNet(nn.Module):
-    """
-    Deep Q-Network for Tetris.
-
-    Input  : observation vector (45 floats)
-    Output : Q-value for each of the 6 actions
-    """
-
     def __init__(self, input_size: int = 45, n_actions: int = 6):
         super().__init__()
 

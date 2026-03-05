@@ -4,7 +4,7 @@ import sys
 import time
 from collections import deque
 
-# ── Constants ────────────────────────────────────────────────────────────────
+#  Constants 
 
 CELL = 30
 COLS = 10
@@ -52,7 +52,7 @@ TETROMINOES = {
 
 LINE_SCORES = {1: 100, 2: 300, 3: 500, 4: 800}
 
-# ── Piece ────────────────────────────────────────────────────────────────────
+#  Piece 
 
 class Piece:
     def __init__(self, kind=None):
@@ -67,7 +67,7 @@ class Piece:
         return [list(row) for row in zip(*m[::-1])]
 
 
-# ── Board ─────────────────────────────────────────────────────────────────────
+#  Board 
 
 class Board:
     def __init__(self):
@@ -107,7 +107,7 @@ class Board:
         return gy
 
 
-# ── Stats tracker ─────────────────────────────────────────────────────────────
+#  Stats tracker 
 
 class Stats:
     def __init__(self):
@@ -136,7 +136,7 @@ class Stats:
         return int(time.time() - self.start)
 
 
-# ── Rendering helpers ─────────────────────────────────────────────────────────
+#  Rendering helpers 
 
 def draw_cell(surf, color, x, y, alpha=255, ghost=False):
     rect = pygame.Rect(x * CELL, y * CELL, CELL - 1, CELL - 1)
@@ -294,7 +294,7 @@ def draw_graph(surf, data, x, y, w, h, line_color, fill_color):
     pygame.draw.lines(surf, line_color, False, pts, 2)
 
 
-# ── Game ──────────────────────────────────────────────────────────────────────
+#  Game 
 
 class Game:
     def __init__(self):

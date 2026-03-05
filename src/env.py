@@ -1,29 +1,3 @@
-"""
-env.py — Tetris RL Environment Wrapper
-
-Exposes a Gymnasium-style interface:
-    obs, info = env.reset()
-    obs, reward, done, info = env.step(action)
-
-Actions (6):
-    0 = move left
-    1 = move right
-    2 = rotate
-    3 = soft drop
-    4 = hard drop
-    5 = do nothing (1 natural fall tick)
-
-State (observation) — 1D numpy array of floats:
-    - Board columns heights          (10 values)
-    - Holes per column               (10 values)
-    - Bumpiness per adjacent pair    (9 values)
-    - Max height                     (1 value)
-    - Lines cleared this game        (1 value)
-    - Current piece type one-hot     (7 values)
-    - Next piece type one-hot        (7 values)
-    Total: 45 values
-"""
-
 import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -37,7 +11,7 @@ from game import (
     draw_board, draw_piece, draw_panel,
 )
 
-# ── Action space ──────────────────────────────────────────────────────────────
+#  Action space 
 
 ACTIONS = {
     0: "left",
@@ -49,12 +23,12 @@ ACTIONS = {
 }
 N_ACTIONS = len(ACTIONS)
 
-# ── Piece index map (for one-hot encoding) ────────────────────────────────────
+#  Piece index map (for one-hot encoding) 
 
 PIECE_KINDS = ["I", "O", "T", "S", "Z", "J", "L"]
 PIECE_IDX   = {k: i for i, k in enumerate(PIECE_KINDS)}
 
-# ── Reward constants ──────────────────────────────────────────────────────────
+#  Reward constants 
 
 R_SURVIVAL          =  0.01   # per piece placed — rewards staying alive
 R_LINE_1            =  1.0
@@ -76,7 +50,7 @@ R_DEATH             = -20.0
 LINE_REWARDS = {1: R_LINE_1, 2: R_LINE_2, 3: R_LINE_3, 4: R_TETRIS}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+#  Helpers 
 
 def board_heights(grid):
     """Height of each column (0 = empty col)."""
@@ -134,7 +108,7 @@ def detect_tspin(board, piece, rotated):
     return filled >= 3
 
 
-# ── Environment ───────────────────────────────────────────────────────────────
+#  Environment 
 
 class TetrisEnv:
     """
@@ -166,7 +140,7 @@ class TetrisEnv:
         self._land_steps  = 0       # steps spent sitting on ground
         self._LOCK_STEPS  = 30      # ~0.5s at 60fps — standard Tetris lock delay
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    #  Public API 
 
     def reset(self):
         """Start a new game. Returns initial observation."""
@@ -203,7 +177,7 @@ class TetrisEnv:
 
         act = ACTIONS[action]
 
-        # ── Apply action ──────────────────────────────────────────────────────
+        #  Apply action 
         if act == "left":
             if self.board.valid(self.piece, ox=-1):
                 self.piece.x -= 1
@@ -248,7 +222,7 @@ class TetrisEnv:
             else:
                 placed = True
 
-        # ── Lock delay — piece must sit on ground for _LOCK_STEPS before locking ──
+        #  Lock delay — piece must sit on ground for _LOCK_STEPS before locking 
         # Hard drop bypasses this (placed=True already set above).
         # Moves/rotations while grounded reset the counter (standard Tetris rule).
         if not placed:
@@ -264,7 +238,7 @@ class TetrisEnv:
             else:
                 self._land_steps = 0
 
-        # ── Place piece and compute rewards when locked ───────────────────────
+        #  Place piece and compute rewards when locked 
         if placed:
             holes_before = sum(board_holes(self.board.grid,
                                            board_heights(self.board.grid)))
@@ -277,7 +251,7 @@ class TetrisEnv:
             heights_now  = board_heights(self.board.grid)
             max_h        = max(heights_now)
 
-            # ── Reward: line clears ───────────────────────────────────────────
+            #  Reward: line clears 
             if cleared > 0:
                 reward += LINE_REWARDS.get(cleared, R_TETRIS)
 
@@ -300,23 +274,23 @@ class TetrisEnv:
                 if all(not any(row) for row in self.board.grid):
                     reward += R_PERFECT_CLEAR
 
-            # ── Reward: survival ──────────────────────────────────────────────
+            #  Reward: survival 
             reward += R_SURVIVAL
 
-            # ── Penalty: new holes ────────────────────────────────────────────
+            #  Penalty: new holes 
             new_holes = max(0, holes_after - holes_before)
             reward += new_holes * R_HOLE_PENALTY
 
-            # ── Penalty: height approaching danger zone ───────────────────────
+            #  Penalty: height approaching danger zone 
             if max_h > R_DANGER_THRESHOLD:
                 excess = max_h - R_DANGER_THRESHOLD
                 reward += excess * R_HEIGHT_PENALTY
 
-            # ── Update stats ──────────────────────────────────────────────────
+            #  Update stats 
             self.stats.add_lines(cleared, self.stats.level)
             self.stats.record()
 
-            # ── Spawn next piece ──────────────────────────────────────────────
+            #  Spawn next piece 
             self.piece = self.next
             self.next  = Piece()
 
@@ -324,7 +298,7 @@ class TetrisEnv:
                 reward += R_DEATH
                 self.done = True
 
-        # ── Render ────────────────────────────────────────────────────────────
+        #  Render 
         if self.render_mode:
             self._render()
 
@@ -343,7 +317,7 @@ class TetrisEnv:
             pygame.quit()
             self._screen = None
 
-    # ── Observation ───────────────────────────────────────────────────────────
+    #  Observation 
 
     def _observe(self):
         grid    = self.board.grid
@@ -369,7 +343,7 @@ class TetrisEnv:
     def observation_size(self):
         return 45
 
-    # ── Rendering ─────────────────────────────────────────────────────────────
+    #  Rendering 
 
     def _init_render(self):
         if self._screen:
@@ -405,7 +379,7 @@ class TetrisEnv:
         self._clock.tick(self.render_fps)
 
 
-# ── Quick sanity check ────────────────────────────────────────────────────────
+#  Quick sanity check 
 
 if __name__ == "__main__":
     import random

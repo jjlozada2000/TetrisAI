@@ -1,17 +1,3 @@
-"""
-train.py — DQN Training Loop for Tetris
-
-Usage:
-    python3 src/train.py                  # headless, fast
-    python3 src/train.py --render         # watch it play in real time
-    python3 src/train.py --resume         # continue from last checkpoint
-    python3 src/train.py --render --resume
-
-Logs are saved to: runs/train_<timestamp>.log
-Checkpoints are saved to: models/checkpoint_ep<N>.pt
-                           models/best.pt  (best score so far)
-"""
-
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -24,7 +10,7 @@ import numpy as np
 from env   import TetrisEnv
 from agent import DQNAgent, TARGET_UPDATE
 
-# ── Config ────────────────────────────────────────────────────────────────────
+#  Config 
 
 EPISODES         = 5_000     # total training episodes
 SAVE_EVERY       = 250       # save checkpoint every N episodes
@@ -36,7 +22,7 @@ BEST_PATH        = os.path.join(CHECKPOINT_DIR, "best.pt")
 LATEST_PATH      = os.path.join(CHECKPOINT_DIR, "latest.pt")
 
 
-# ── Logger ────────────────────────────────────────────────────────────────────
+#  Logger 
 
 class Logger:
     def __init__(self, path: str):
@@ -78,7 +64,7 @@ def print_progress(ep, total, score, best, lines, epsilon, loss_avg, duration):
     )
 
 
-# ── Training loop ─────────────────────────────────────────────────────────────
+#  Training loop 
 
 def train(render: bool = False, resume: bool = False):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -127,7 +113,7 @@ def train(render: bool = False, resume: bool = False):
             obs        = next_obs
             ep_reward += reward
 
-        # ── Episode complete ──────────────────────────────────────────────────
+        #  Episode complete 
         score    = info["score"]
         lines    = info["lines"]
         pieces   = info.get("pieces", 0)
@@ -156,14 +142,14 @@ def train(render: bool = False, resume: bool = False):
             print_progress(ep, EPISODES, score, best_score,
                            lines, agent.epsilon, loss_avg, duration)
 
-    # ── Done ──────────────────────────────────────────────────────────────────
+    #  Done 
     print(f"\nTraining complete. Best score: {best_score}")
     print(f"Log saved to: {log_path}")
     logger.close()
     env.close()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+#  Entry point 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the Tetris DQN agent.")

@@ -1,21 +1,3 @@
-"""
-agent.py — DQN Agent for Tetris
-
-How DQN works:
-    1. Agent observes the board state
-    2. With probability epsilon it picks a random action (exploration)
-       otherwise it picks the action with the highest Q-value (exploitation)
-    3. It stores every (state, action, reward, next_state, done) in a replay buffer
-    4. Every few steps it samples a random batch from the buffer and trains the network
-    5. Epsilon slowly decays — early on the agent explores randomly,
-       later it exploits what it has learned
-
-Two networks:
-    - policy_net  : updated every training step — the network that's actively learning
-    - target_net  : a frozen copy updated every N steps — used to compute stable
-                    TD targets, preventing the training from chasing a moving target
-"""
-
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -32,7 +14,7 @@ from model import TetrisNet
 from env import N_ACTIONS
 
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
+# Hyperparameters
 
 BATCH_SIZE       = 64       # samples per training step
 GAMMA            = 0.99     # discount factor — how much future rewards matter
@@ -44,7 +26,7 @@ EPSILON_DECAY    = 0.9995   # multiply epsilon by this each step
 TARGET_UPDATE    = 500      # sync target network every N steps
 
 
-# ── Replay Buffer ─────────────────────────────────────────────────────────────
+# Replay Buffer
 
 class ReplayBuffer:
     """
@@ -74,7 +56,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# ── DQN Agent ─────────────────────────────────────────────────────────────────
+# DQN Agent
 
 class DQNAgent:
     """
@@ -121,7 +103,7 @@ class DQNAgent:
         self.steps     = 0
         self.losses    = []
 
-    # ── Action selection ──────────────────────────────────────────────────────
+    # Action selection
 
     def select_action(self, state: np.ndarray) -> int:
         """
@@ -136,12 +118,12 @@ class DQNAgent:
             q_values = self.policy_net(t)
             return int(q_values.argmax().item())
 
-    # ── Memory ────────────────────────────────────────────────────────────────
+    # Memory
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.push(state, action, reward, next_state, done)
 
-    # ── Training step ─────────────────────────────────────────────────────────
+    # Training step
 
     def train_step(self) -> float | None:
         """
@@ -181,18 +163,18 @@ class DQNAgent:
         self.losses.append(loss_val)
         return loss_val
 
-    # ── Epsilon decay ─────────────────────────────────────────────────────────
+    # Epsilon decay
 
     def decay_epsilon(self):
         self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
         self.steps  += 1
 
-    # ── Target network sync ───────────────────────────────────────────────────
+    # Target network sync
 
     def sync_target(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    # ── Save / load ───────────────────────────────────────────────────────────
+    # Save / load
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -215,7 +197,7 @@ class DQNAgent:
         print(f"Loaded checkpoint ← {path}")
 
 
-# ── Sanity check ──────────────────────────────────────────────────────────────
+# Sanity check
 
 if __name__ == "__main__":
     print("Running agent sanity check...")
