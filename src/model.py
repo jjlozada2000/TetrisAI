@@ -1,41 +1,43 @@
-"""
-model.py — Deep Q-Network for Tetris
 
-Matching vietnh1009/Tetris-deep-Q-learning-pytorch:
-    Input:  4 features (lines_cleared, holes, bumpiness, total_height)
-    Hidden: 64 → 64 neurons with ReLU
-    Output: 1 scalar (predicted value of this board state)
-"""
+import json
+import os
 
-import torch
-import torch.nn as nn
+DEFAULT_WEIGHTS = {
+    "aggregate_height": -0.52,
+    "holes": -6.8,
+    "bumpiness": -0.32,
+    "completed_lines": 7.4,
+    "max_height": -0.30,
+    "row_transitions": -0.28,
+    "col_transitions": -0.25,
+    "covered_cells": -0.22,
+    "right_well_depth": 1.75,
+    "right_well_open": 2.2,
+    "right_well_blocked": -4.4,
+    "well_lock_bonus": 2.8,
+    "well_lock_break_penalty": -5.8,
+    "i_ready_bonus": 2.6,
+    "perfect_clear_bonus": 18.0,
+    "perfect_clear_setup": 1.35,
+    "tetris_bonus": 4.6,
+    "danger_penalty": -1.1,
+}
 
+WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "heuristic_weights.json")
 
-class DeepQNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(4, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-        self._init_weights()
+def load_weights():
+    if os.path.exists(WEIGHTS_PATH):
+        try:
+            with open(WEIGHTS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = dict(DEFAULT_WEIGHTS)
+            merged.update({k: float(v) for k, v in data.items()})
+            return merged
+        except Exception:
+            pass
+    return dict(DEFAULT_WEIGHTS)
 
-    def _init_weights(self):
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-if __name__ == "__main__":
-    model = DeepQNetwork()
-    x = torch.FloatTensor([[0, 0, 0, 0]])
-    print(f"Output: {model(x).item():.4f}")
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
-    print("OK")
+def save_weights(weights):
+    os.makedirs(os.path.dirname(WEIGHTS_PATH), exist_ok=True)
+    with open(WEIGHTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(weights, f, indent=2, sort_keys=True)
